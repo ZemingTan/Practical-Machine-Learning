@@ -8,4 +8,5 @@ This repository is a project of Practical Machine Learning on Coursera. The Proj
 |rpart.plot  |  3.1.5|
 |corrplot    |   0.95|
 |gbm         |  2.3.1|
-
+You can view the HTML page here:
+https://zemingtan.github.io/Practical-Machine-Learning/Project.html

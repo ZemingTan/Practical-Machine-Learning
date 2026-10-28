@@ -1,0 +1,393 @@
+---
+title: "Practical Machine Learning Course Project: Predicting Exercise Manner"
+author: "Zeming Tan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## 1. Introduction
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit, it is possible to collect large amounts of personal activity data. This project uses accelerometer data from the belt, forearm, arm, and dumbbell of six participants to predict how well they performed barbell lifts.
+
+The outcome variable is `classe`, a factor with five levels (A–E) representing different ways of performing the exercise: one correct class and four incorrect classes.
+
+The goals of this report are to:
+
+1. Build models to predict `classe` from the available measurements.
+2. Compare CART, Random Forest, and GBM using a common held-out validation set.
+3. Report the validation-set error while noting the limitations of using that set for model selection.
+4. Apply the selected model to the 20 provided test cases.
+
+## 2. Data Loading
+
+```{r libraries}
+library(caret)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(corrplot)
+library(gbm)
+
+set.seed(12345)
+```
+
+```{r load-data}
+trainUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testUrl  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+if (!file.exists("pml-training.csv")) {
+  download.file(trainUrl, "pml-training.csv", mode = "wb")
+}
+if (!file.exists("pml-testing.csv")) {
+  download.file(testUrl, "pml-testing.csv", mode = "wb")
+}
+
+trainRaw <- read.csv(
+  "pml-training.csv",
+  na.strings = c("NA", "#DIV/0!", "")
+)
+testRaw <- read.csv(
+  "pml-testing.csv",
+  na.strings = c("NA", "#DIV/0!", "")
+)
+
+dim(trainRaw)
+dim(testRaw)
+```
+
+The training file contains the labeled observations used to fit and evaluate the models. The test file contains 20 observations for which the outcome is not provided.
+
+## 3. Data Cleaning
+
+Columns with more than 95% missing values and near-zero-variance columns are removed. Metadata columns are also explicitly excluded from the predictors. The same retained  columns are used for the training and test data.
+
+```{r clean-data}
+# Outcome must be present in the training data.
+stopifnot("classe" %in% names(trainRaw))
+
+# Remove columns with more than 95% missing values.
+naRatio <- vapply(trainRaw, function(x) mean(is.na(x)), numeric(1))
+keepCols <- names(naRatio)[naRatio <= 0.95]
+
+# Retain only columns also available in the test data.
+keepCols <- intersect(keepCols, names(testRaw))
+
+# The test file does not contain the outcome.
+keepCols <- setdiff(keepCols, "classe")
+predictorCols <- keepCols
+
+# Explicitly exclude identifiers, timestamps, and window metadata.
+# intersect() makes this robust to small differences in column names.
+metadataCols <- c(
+  "X", "user_name",
+  "raw_timestamp_part_1", "raw_timestamp_part_2",
+  "cvtd_timestamp", "new_window", "num_window"
+)
+predictorCols <- setdiff(predictorCols, metadataCols)
+
+# Remove near-zero-variance predictors, determined from training data.
+nzvIndex <- nearZeroVar(trainRaw[, predictorCols, drop = FALSE])
+if (length(nzvIndex) > 0) {
+  predictorCols <- predictorCols[-nzvIndex]
+}
+
+# Build matching modeling data frames.
+trainClean <- trainRaw[, c(predictorCols, "classe"), drop = FALSE]
+testClean  <- testRaw[, predictorCols, drop = FALSE]
+
+# Make sure the outcome is a factor.
+trainClean$classe <- factor(trainClean$classe)
+
+dim(trainClean)
+dim(testClean)
+length(predictorCols)
+```
+
+After cleaning, the modeling data contain the retained sensor predictors and the outcome. The metadata exclusions are performed explicitly in the code above rather than inferred from the missingness or variance filters.
+
+## 4. Exploratory Analysis
+
+The correlation plot below shows correlations among numeric predictors. Correlations are expected because multiple sensors and axes can measure related physical quantities.
+
+```{r correlation-plot, fig.width=10, fig.height=8}
+numericVars <- vapply(trainClean[, predictorCols, drop = FALSE],
+                      is.numeric, logical(1))
+
+if (sum(numericVars) > 1) {
+  corMatrix <- cor(
+    trainClean[, predictorCols[numericVars], drop = FALSE],
+    use = "pairwise.complete.obs"
+  )
+  corrplot(
+    corMatrix,
+    method = "color",
+    type = "upper",
+    tl.cex = 0.5,
+    tl.col = "black"
+  )
+}
+```
+
+Tree-based models are generally less affected by correlated predictors than many linear models. No PCA or other dimensionality-reduction procedure is applied here.
+
+## 5. Data Splitting and Resampling Strategy
+
+The labeled data are partitioned into a training subset (70%) and a held-out validation subset (30%). The validation subset is used to compare the models and select a final model; therefore, it is not a completely untouched final test set.
+
+CART uses 5-fold cross-validation through `caret::trainControl`. GBM uses 3-fold cross-validation through `cv.folds = 3`. Random Forest uses its built-in out-of-bag (OOB) error as an internal training diagnostic. All three models are evaluated on the same held-out validation subset.
+
+```{r split-data}
+set.seed(12345)
+inTrain <- createDataPartition(
+  trainClean$classe,
+  p = 0.7,
+  list = FALSE
+)
+
+trainData <- trainClean[inTrain, , drop = FALSE]
+validData <- trainClean[-inTrain, , drop = FALSE]
+
+dim(trainData)
+dim(validData)
+
+cartControl <- trainControl(
+  method = "cv",
+  number = 5
+)
+```
+
+## 6. Model Building
+
+### 6.1 Classification Tree (CART)
+
+A single classification tree is used as a baseline model. Its complexity parameter is selected using 5-fold cross-validation on the training subset.
+
+```{r fit-cart}
+set.seed(12345)
+modCart <- train(
+  classe ~ .,
+  data = trainData,
+  method = "rpart",
+  trControl = cartControl
+)
+
+modCart
+```
+
+```{r plot-cart, fig.width=9, fig.height=7}
+rpart.plot(
+  modCart$finalModel,
+  main = "Classification Tree",
+  extra = 104,
+  nn = TRUE
+)
+```
+
+```{r evaluate-cart}
+predCart <- predict(modCart, newdata = validData)
+cmCart <- confusionMatrix(predCart, validData$classe)
+cmCart
+```
+
+The CART validation accuracy is calculated from the held-out validation predictions shown above. A single tree may underfit complex, high-dimensional sensor data; this is one reason to compare it with ensemble methods.
+
+### 6.2 Random Forest
+
+Random Forest is fitted directly with the `randomForest` package. Its OOB error is an internal estimate produced during training. The validation-set confusion matrix below is the common metric used for comparison with CART and GBM.
+
+```{r fit-rf}
+set.seed(12345)
+modRF <- randomForest(
+  classe ~ .,
+  data = trainData,
+  ntree = 100,
+  importance = TRUE
+)
+
+modRF
+```
+
+```{r evaluate-rf}
+predRF <- predict(modRF, newdata = validData)
+cmRF <- confusionMatrix(predRF, validData$classe)
+cmRF
+```
+
+```{r rf-importance, fig.width=9, fig.height=7}
+varImpPlot(
+  modRF,
+  main = "Random Forest Variable Importance"
+)
+```
+
+The OOB error is useful as an internal training diagnostic, but it is not the same quantity as the held-out validation error. The model comparison below uses validation-set accuracy for all three models.
+
+### 6.3 Gradient Boosting Machine (GBM)
+
+GBM is fitted using a multinomial outcome and 3-fold cross-validation as specified by `cv.folds = 3`. The number of boosting trees is set to 100 in this model.
+
+```{r fit-gbm}
+set.seed(12345)
+modGBM <- gbm(
+  classe ~ .,
+  data = trainData,
+  distribution = "multinomial",
+  n.trees = 100,
+  interaction.depth = 3,
+  shrinkage = 0.1,
+  cv.folds = 3,
+  verbose = FALSE
+)
+best.iter <- gbm.perf(modGBM, method = "cv")
+best.iter
+```
+
+For multinomial GBM, predictions are returned as class probabilities. The predicted class is the class with the largest probability.
+
+```{r evaluate-gbm}
+gbmProb <- predict(
+  modGBM,
+  newdata = validData,
+  n.trees = 100,
+  type = "response"
+)
+
+if (length(dim(gbmProb)) == 3) {
+  gbmProb <- gbmProb[, , dim(gbmProb)[3], drop = FALSE]
+  gbmProb <- matrix(
+    gbmProb,
+    nrow = nrow(validData),
+    ncol = length(levels(trainData$classe))
+  )
+}
+
+gbmProb <- as.matrix(gbmProb)
+
+stopifnot(nrow(gbmProb) == nrow(validData))
+
+gbmClassLevels <- levels(trainData$classe)
+stopifnot(ncol(gbmProb) == length(gbmClassLevels))
+
+gbmClassIndex <- max.col(gbmProb, ties.method = "first")
+
+predGBM <- factor(
+  gbmClassLevels[gbmClassIndex],
+  levels = gbmClassLevels
+)
+
+stopifnot(length(predGBM) == nrow(validData))
+
+cmGBM <- confusionMatrix(
+  data = predGBM,
+  reference = validData$classe
+)
+cmGBM
+```
+
+## 7. Model Comparison and Final Model Selection
+
+The following table compares the three models using accuracy on the same held-out validation subset. Their internal resampling methods differ (5-fold CV for CART, 3-fold CV for GBM, and OOB for Random Forest), but the final validation metric used for comparison is common across all three models.
+
+```{r model-comparison}
+results <- data.frame(
+  Model = c("CART", "Random Forest", "GBM"),
+  Accuracy = c(
+    unname(cmCart$overall["Accuracy"]),
+    unname(cmRF$overall["Accuracy"]),
+    unname(cmGBM$overall["Accuracy"])
+  )
+)
+
+results$ValidationError <- 1 - results$Accuracy
+results
+
+knitr::kable(
+  results,
+  digits = 4,
+  caption = "Validation-Set Accuracy and Error by Model"
+)
+
+ggplot(results, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = round(Accuracy, 3)), vjust = -0.5) +
+  ylim(0, 1) +
+  labs(
+    title = "Validation Accuracy by Model",
+    y = "Validation Accuracy",
+    x = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r select-model}
+bestModelName <- results$Model[which.max(results$Accuracy)]
+bestModelName
+```
+
+The model with the highest validation accuracy is selected for prediction on the 20 test cases. Because the validation subset was used to compare models and make this selection, its accuracy may be somewhat optimistic as an estimate of final generalization performance; a truly independent test set would be needed to remove this optimism entirely.
+
+It is also worth noting that for the GBM model, `best.iter` from `gbm.perf()` was equal to the upper bound of `n.trees` specified (`r best.iter`). This suggests the cross-validation error for GBM may not yet have reached its minimum within the tested range of boosting iterations, and GBM's reported accuracy here should be interpreted as a lower bound on its potential performance under the current hyperparameter settings, rather than its fully optimized result. Despite this, GBM's validation accuracy remains lower than Random Forest's, so this caveat does not affect the final model selection in this case.
+
+## 8. Validation-Set Error
+
+```{r validation-error}
+validationErrorRF <- 1 - unname(cmRF$overall["Accuracy"])
+validationErrorRF
+```
+
+The value above is the Random Forest misclassification rate on the held-out validation subset. It is a validation-set estimate, not a fully independent final test error, because that subset was also used for model comparison and selection.
+
+## 9. Random Forest Confusion Matrix
+
+```{r rf-confusion-matrix}
+cmRF$table
+```
+
+The confusion matrix reports the observed validation classifications. Performance should be interpreted using these results rather than the training OOB error alone.
+
+## 10. Prediction on the 20 Test Cases
+
+The selected model is applied to the 20 test observations. The test data were cleaned using the same predictor columns as the training data.
+
+```{r test-predictions}
+if (bestModelName == "Random Forest") {
+  predTest <- predict(modRF, newdata = testClean)
+} else if (bestModelName == "CART") {
+  predTest <- predict(modCart, newdata = testClean)
+} else {
+  testProb <- predict(
+    modGBM,
+    newdata = testClean,
+    n.trees = 100,
+    type = "response"
+  )
+  testClassIndex <- max.col(testProb, ties.method = "first")
+  predTest <- factor(
+    gbmClassLevels[testClassIndex],
+    levels = gbmClassLevels
+  )
+}
+
+predTest
+```
+
+## 11. Conclusion
+
+Three models—CART, Random Forest, and GBM—were fitted and evaluated. CART used 5-fold cross-validation, GBM used 3-fold cross-validation, and Random Forest used its built-in OOB estimate as an internal raining diagnostic. All three models were compared using the same held-out validation subset.
+
+The data-cleaning code removes columns with excessive missingness, near-zero-variance predictors, and explicitly listed metadata fields. The validation accuracy and error are calculated from predictions on the held-out subset. Since that subset was used to compare models and select the final model, these results should be treated as validation estimates rather than as a completely independent final test estimate.
+
+The selected model is then used to predict the 20 unlabeled test observations.
